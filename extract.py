@@ -3,7 +3,7 @@
 
 This script extracts data from the raw FARS data files to be used for Levitt & Porter (2001) replication and bias correction.
 Selected variables are included, and the data definitions are harmonized across years.
-Accident, vehicle, and person dataframes are constructed and stored in csv files for later use in the replication.
+Accident, vehicle, and person dataframes are constructed and stored in csv files for later use.
 
 This script has been validated for FARS datasets from 1982 to 2023.
 The crash matching process required for bias correction requires a one year crash buffer
