@@ -1,4 +1,4 @@
-import pandas, numpy, time, us, random, math, warnings
+import pandas, numpy, time, us, random, math, warnings, sklearn
 from timezonefinder import TimezoneFinder
 from geopy import distance
 from math import radians
@@ -134,7 +134,6 @@ def find_missing_data(df_accident,df_vehicle,df_driver,incl_drinking=False):
 	return df_missing
 
 
-
 def get_analytic_sample(df_accident,df_vehicle,df_person,bac_threshold,drinking_definition,st_yr_threshold=1,year=-1,num_closest=5,mireps=10,
 						state=False,day_type=False,first_year=-1,last_year=-1,earliest_hour=-1,latest_hour=-1):
 
@@ -220,32 +219,30 @@ def get_analytic_sample(df_accident,df_vehicle,df_person,bac_threshold,drinking_
 	return analytic_sample[['month','day','ve_forms','state_abbr','year','hour','day_type','time_day','latitude','longitud']+mibac_header+[f'mibac{i}_2' for i in range(1,mireps+1)]]
 
 
-def get_estimation_sample(analytic_sample, bac_threshold, bc_mixing, mirep, incl_s=False):
+def get_estimation_sample(analytic_sample, bac_threshold, bc_mixing, mirep):
 	estimation_sample = analytic_sample[bc_mixing+['ve_forms','mibac'+str(mirep), 'mibac'+str(mirep)+'_2']].rename(columns={'mibac'+str(mirep): 'bac1', 'mibac'+str(mirep)+'_2': 'bac2'})
 
 	if bac_threshold == 0:
 		bac_threshold = 1 # change BAC threshold to minimum drinking value
 
 	estimation_sample['a1_s'] = 0
-	estimation_sample.loc[(estimation_sample['ve_forms']==1) & (estimation_sample['bac1']==0),'a1_s'] = 1 # single car nondrinking driver
+	estimation_sample.loc[(estimation_sample['ve_forms']==1) & (estimation_sample['bac1']==0),'a1_s'] = 1 # single vehicle nondrinking driver
 
 	estimation_sample['a1_d'] = 0
-	estimation_sample.loc[(estimation_sample['ve_forms']==1) & (estimation_sample['bac1']>=bac_threshold),'a1_d'] = 1 # single car drinking driver
+	estimation_sample.loc[(estimation_sample['ve_forms']==1) & (estimation_sample['bac1']>=bac_threshold),'a1_d'] = 1 # single vehicle drinking driver
 
 	estimation_sample['a1_d_d'] = 0
-	estimation_sample.loc[(estimation_sample['a1_d']==1) & (estimation_sample['bac2']>=bac_threshold),'a1_d_d'] = 1 # single car drinking driver, with closest drinking driver
-	if incl_s == True:
-		estimation_sample.loc[(estimation_sample['a1_s']==1) & (estimation_sample['bac2']>=bac_threshold),'a1_d_d'] = 1 # include nearest neighbor drinking status of sober drivers
+	estimation_sample.loc[(estimation_sample['ve_forms']==1) & (estimation_sample['bac2']>=bac_threshold),'a1_d_d'] = 1 # drinking status of nearest single vehicle crash
 
 	estimation_sample['a2_ss'] = 0
 	estimation_sample.loc[(estimation_sample['ve_forms']==2) & (estimation_sample['bac1']==0) & (estimation_sample['bac2']==0),'a2_ss'] = 1 # 2 nondrinking drivers
 
 	estimation_sample['a2_sd'] = 0
-	estimation_sample.loc[(estimation_sample['ve_forms']==2) & (estimation_sample['bac1']>=bac_threshold) & (estimation_sample['bac2']==0),'a2_sd'] = 1 # 1 drinking driver
-	estimation_sample.loc[(estimation_sample['ve_forms']==2) & (estimation_sample['bac1']==0) & (estimation_sample['bac2']>=bac_threshold),'a2_sd'] = 1 # 1 drinking driver
+	estimation_sample.loc[(estimation_sample['ve_forms']==2) & (estimation_sample['bac1']>=bac_threshold) & (estimation_sample['bac2']==0),'a2_sd'] = 1 # two vehicle crash, one drinking driver
+	estimation_sample.loc[(estimation_sample['ve_forms']==2) & (estimation_sample['bac1']==0) & (estimation_sample['bac2']>=bac_threshold),'a2_sd'] = 1 # two vehicle rash, one drinking driver
 
 	estimation_sample['a2_dd'] = 0
-	estimation_sample.loc[(estimation_sample['ve_forms']==2) & (estimation_sample['bac1']>=bac_threshold) & (estimation_sample['bac2']>=bac_threshold),'a2_dd'] = 1 # 2 drinking drivers
+	estimation_sample.loc[(estimation_sample['ve_forms']==2) & (estimation_sample['bac1']>=bac_threshold) & (estimation_sample['bac2']>=bac_threshold),'a2_dd'] = 1 # two vehicle crash, two drinking drivers
 
 	estimation_sample['a1_total'] = estimation_sample['a1_s'] + estimation_sample['a1_d']
 	estimation_sample['a2_total'] = estimation_sample['a2_ss'] + estimation_sample['a2_sd'] + estimation_sample['a2_dd']
@@ -253,34 +250,68 @@ def get_estimation_sample(analytic_sample, bac_threshold, bc_mixing, mirep, incl
 	return estimation_sample[bc_mixing+['a1_s','a1_d','a1_total','a1_d_d','a2_ss','a2_sd','a2_dd','a2_total']]
 
 
+def get_estimation_cells(estimation_sample,bc_mixing):
+	if len(bc_mixing) > 0:
+		estimation_cells = estimation_sample.groupby(delta_mixing).sum().reset_index()[delta_mixing]
+		estimation_sample_a1 = estimation_sample[estimation_sample['a1_total']==1]
+		for cell, cell_info in estimation_cells.iterrows(): # fit delta values for observational units
+			sample_crashes = estimation_sample_a1.copy()
+			for (parameter, value) in zip(delta_mixing, list(cell_info)[:4]):
+				sample_crashes = sample_crashes[sample_crashes[parameter]==value]
+			if len(sample_crashes.index) > 0:
+				drinking_status = sample_crashes['a1_d'].values.reshape(len(sample_crashes.index), 1)
+				neighbor_drink = sample_crashes['a1_d_d'].values.reshape(len(sample_crashes.index), 1)
+
+				regr = sklearn.linear_model.LinearRegression()
+				regr.fit(drinking_status, neighbor_drink)
+				estimation_cells.loc[cell,'a1_delta'] = round(1+regr.coef_[0][0],3)
+		estimation_sample = estimation_sample.groupby(bc_mixing).sum().merge(estimation_cells.set_index(delta_mixing),how='left',left_index=True,right_index=True)
+
+	else:
+		estimation_sample_a1 = estimation_sample[estimation_sample['a1_total']==1]
+		drinking_status = estimation_sample_a1['a1_d'].values.reshape(len(estimation_sample_a1.index), 1)
+		neighbor_drink = estimation_sample_a1['a1_d_d'].values.reshape(len(estimation_sample_a1.index), 1)
+		regr = sklearn.linear_model.LinearRegression()
+		regr.fit(drinking_status, neighbor_drink)
+
+		#sample_delta = round(1+regr.coef_[0][0],3)
+		#estimation_sample = estimation_sample.groupby(bc_mixing).sum().merge(estimation_cells,how='left',left_index=True,right_index=True)
+		estimation_sample = estimation_sample.groupby(bc_mixing).sum()
+		estimation_sample.loc[:,'a1_delta'] = round(1+regr.coef_[0][0],3)
+
+	return estimation_sample[['a1_s','a1_d','a1_total','a1_delta','a2_ss','a2_sd','a2_dd','a2_total']]
+
+
+
 def fit_model(analytic_sample, bac_threshold, bc_mixing, bsreps, mirep):
-	df_parameters = pandas.DataFrame()
-	boot_results = numpy.zeros((bsreps,5))
+	#df_parameters = pandas.DataFrame()
+	boot_results = numpy.zeros((bsreps,6))
 	estimation_sample = get_estimation_sample(analytic_sample, bac_threshold, bc_mixing, mirep=mirep)
+	estimation_sample_a1 = estimation_sample[estimation_sample['a1_total']==1]
 	estimation_sample = estimation_sample.groupby(bc_mixing).sum()
-	for bsrep in range(bsreps):
+
+	one_veh_ratio = estimation_sample['a1_d'].sum()/estimation_sample['a1_s'].sum() # save one vehicle crash ratio before elimination
+	regr = sklearn.linear_model.LinearRegression() # regresssion of single vehicle and neighbor drinking status excess interaction parameters
+	regr.fit(estimation_sample_a1['a1_d'].values.reshape(len(estimation_sample_a1.index), 1), estimation_sample_a1['a1_d_d'].values.reshape(len(estimation_sample_a1.index), 1))
+	one_veh_alpha0 = round(regr.intercept_[0],3)
+	one_veh_alpha = round(regr.coef_[0][0],3)
+
+	for bsrep in range(bsreps): # bootstrap estimates
 		bs_sample = estimation_sample.sample(frac=1,replace=True)
-		one_veh_ratio = estimation_sample['a1_d'].sum()/estimation_sample['a1_s'].sum() # save one vehicle crash ratio before eliminating values
-		#print(one_veh_ratio)
 
 		# remove observations with 0 values, otherwise it will not converge    
 		bs_sample = bs_sample.drop(bs_sample[bs_sample['a1_s'] == 0].index)
 		bs_sample = bs_sample.drop(bs_sample[bs_sample['a1_d'] == 0].index)
-		bs_sample = bs_sample.drop(bs_sample[bs_sample['a1_d_d'] == 0].index)
-		#bs_sample.to_csv('bs_sample.csv')
-
-		parameters = pandas.DataFrame(index=bs_sample.index)
-		parameters['p1_drink'] = bs_sample['a1_d']/(bs_sample['a1_d']+bs_sample['a1_s'])
-		parameters['p1_d_d'] = bs_sample['a1_d_d']/bs_sample['a1_d']
-		parameters['delta'] = parameters['p1_d_d']/parameters['p1_drink']
 
 		mod = DDP(bs_sample)
 		results = mod.fit(start_params=[10,10])
-		boot_results[bsrep,2], boot_results[bsrep,3] = results.params[-2], results.params[-1] #theta, lambda
+		boot_results[bsrep,1], boot_results[bsrep,2] = results.params[-2], results.params[-1] #theta, lambda
 
-		boot_results[bsrep,1] = (1/boot_results[bsrep,3])*one_veh_ratio # N
-		boot_results[bsrep,4] = boot_results[bsrep,1]/(1+boot_results[bsrep,1]) # prevalance
-		df_parameters = pandas.concat((df_parameters, parameters))
+		boot_results[bsrep,0] = (1/boot_results[bsrep,2])*one_veh_ratio # N
+		boot_results[bsrep,3] = boot_results[bsrep,0]/(1+boot_results[bsrep,0]) # prevalance
+
+		boot_results[bsrep,4] = one_veh_alpha0 # national alpha0 estimate
+		boot_results[bsrep,5] = one_veh_alpha # national alpha estimate
 
 	return boot_results
 
@@ -311,6 +342,7 @@ def _ll(A, thet, lamb):
 	ll -= A_2[:,3]*numpy.log(p[:,3])
 	return ll
 
+
 class DDP(GenericLikelihoodModel):
 	def __init__(self, endog, exog=None, **kwds):
 		super(DDP, self).__init__(endog, exog, **kwds)
@@ -323,8 +355,10 @@ class DDP(GenericLikelihoodModel):
 	def fit(self, start_params=None, maxiter=10000, maxfun=5000, **kwds):
 		return super(DDP, self).fit(start_params=start_params, maxiter=maxiter, maxfun=maxfun, disp=False, **kwds)
 
+
 def bs_error(boot_results):
 	return numpy.power(numpy.divide(numpy.power(numpy.subtract(boot_results,boot_results.sum(axis=0)/numpy.size(boot_results,0)),2).sum(axis=0),(numpy.size(boot_results,0))-1),0.5)
+
 
 def mi_se(results, bs_error):
 	return numpy.power(numpy.power(bs_error,2).sum(axis=0)/numpy.size(bs_error,0) + (1+(1/numpy.size(results,0)))*(1/(numpy.size(results,0)-1))*(numpy.power(numpy.subtract(results,results.sum(axis=0)/numpy.size(results,0)),2).sum(axis=0)),0.5)
